@@ -186,7 +186,13 @@ class HopBot(discord.Client):
             if not delivered:
                 self.store.delete(session['id'])
                 self.store.release_cooldown(cooldown_key)
-            await interaction.edit_original_response(content=result, allowed_mentions=NO_MENTIONS)
+            if delivered and not is_private:
+                await interaction.delete_original_response()
+            else:
+                await interaction.edit_original_response(
+                    content=result,
+                    allowed_mentions=NO_MENTIONS
+                )
             # Someone could have responded while the remaining DMs were being delivered.
             if delivered:
                 await self.refresh(session['id'])
