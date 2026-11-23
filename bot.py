@@ -115,10 +115,6 @@ class HopBot(discord.Client):
         if missing:
             raise SessionError('The bot needs these channel permissions: ' + ', '.join(missing))
         caller = channel.permissions_for(interaction.user)
-        allowed_roles = set(self.config['public_role_ids'])
-        if not (caller.mention_everyone or caller.manage_guild or
-                any(role.id in allowed_roles for role in interaction.user.roles)):
-            raise SessionError('Public hops need Mention @everyone permission or a role listed in public_role_ids.')
         return channel
 
     async def create_hop(self, interaction, game_key, private_text):
