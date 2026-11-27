@@ -1,8 +1,8 @@
-"""Run with python bot.py. No message-content intent, web server, or Roblox login."""
 import argparse
 import asyncio
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -13,237 +13,691 @@ from discord import app_commands
 from discord.ext import tasks
 
 from recipients import resolve_recipients
-from roblox import PublicServerTracker, ServerUnavailable, resolve_server
+from roblox import (
+    PublicServerTracker,
+    ServerUnavailable,
+    resolve_server,
+    instance_target,
+)
 from settings import ROOT, credentials, load_config
 from store import SessionError, Store
 from ui import SessionView, safe_name
 
-LOG = logging.getLogger('fumo')
+LOG = logging.getLogger("fumo")
 NO_MENTIONS = discord.AllowedMentions.none()
 
 
 class HopBot(discord.Client):
+
     def __init__(self, config, guild_id, channel_id, store):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.members = True
-        super().__init__(intents=intents, allowed_mentions=NO_MENTIONS)
+        intents.presences = True
+
+        super().__init__(
+            intents=intents,
+            allowed_mentions=NO_MENTIONS
+        )
+
         self.config = config
         self.guild_id = guild_id
         self.channel_id = channel_id
         self.store = store
+
         self.tree = app_commands.CommandTree(self)
         self.http_session = None
         self.server_tracker = None
+
         self.last_population_check = 0
         self.refresh_lock = asyncio.Lock()
+
         self.register_commands()
 
     def register_commands(self):
         guild = discord.Object(id=self.guild_id)
 
-        @self.tree.command(name='hop', description='Invite everyone to Become Fumo.', guild=guild)
+        @self.tree.command(
+            name="hop",
+            description="Invite everyone to Become Fumo.",
+            guild=guild
+        )
         async def hop(interaction: discord.Interaction):
-            await self.create_hop(interaction, 'bf', None)
+            await self.create_hop(interaction, "bf", None)
 
-        advanced = app_commands.Group(name='advanced', description='Choose a game and optional private invitees.')
+        @self.tree.command(
+            name="add",
+            description="Manually add players to the current hop.",
+            guild=guild
+        )
+        async def add(
+            interaction: discord.Interaction,
+            player1: discord.Member,
+            player2: Optional[discord.Member] = None,
+            player3: Optional[discord.Member] = None,
+            player4: Optional[discord.Member] = None,
+            player5: Optional[discord.Member] = None
+        ):
+            await self.manage_players(
+                interaction,
+                [player1, player2, player3, player4, player5],
+                True
+            )
 
-        @advanced.command(name='hop', description='Invite everyone or selected people to BF or SBF.')
-        @app_commands.describe(game='bf = Become Fumo; sbf = Scuffed Become Fumo',
-                               private_users='Optional names, aliases or mentions: loogi ori')
-        @app_commands.rename(private_users='private')
-        @app_commands.choices(game=[app_commands.Choice(name='bf', value='bf'),
-                                    app_commands.Choice(name='sbf', value='sbf')])
-        async def advanced_hop(interaction: discord.Interaction, game: app_commands.Choice[str],
-                               private_users: Optional[str] = None):
-            await self.create_hop(interaction, game.value, private_users)
+        @self.tree.command(
+            name="remove",
+            description="Manually remove players from the current hop.",
+            guild=guild
+        )
+        async def remove(
+            interaction: discord.Interaction,
+            player1: discord.Member,
+            player2: Optional[discord.Member] = None,
+            player3: Optional[discord.Member] = None,
+            player4: Optional[discord.Member] = None,
+            player5: Optional[discord.Member] = None
+        ):
+            await self.manage_players(
+                interaction,
+                [player1, player2, player3, player4, player5],
+                False
+            )
+
+        advanced = app_commands.Group(
+            name="advanced",
+            description="Choose a game and optional private invitees."
+        )
+
+        @advanced.command(
+            name="hop",
+            description="Invite everyone or selected people."
+        )
+        @app_commands.describe(
+            game="bf = Become Fumo; sbf = Scuffed Become Fumo",
+            private_users="Optional names, aliases or mentions"
+        )
+        @app_commands.rename(private_users="private")
+        @app_commands.choices(game=[
+            app_commands.Choice(name="bf", value="bf"),
+            app_commands.Choice(name="sbf", value="sbf")
+        ])
+        async def advanced_hop(
+            interaction: discord.Interaction,
+            game: app_commands.Choice[str],
+            private_users: Optional[str] = None
+        ):
+            await self.create_hop(
+                interaction,
+                game.value,
+                private_users
+            )
 
         self.tree.add_command(advanced, guild=guild)
 
         @self.tree.error
         async def command_error(interaction, error):
-            LOG.error('Command error: %s', type(error).__name__)
-            await self.private_error(interaction, 'The command failed. Check the bot configuration and try again.')
+            LOG.error("Command error: %s", error)
+
+            await self.private_error(
+                interaction,
+                "The command failed. Please try again."
+            )
 
     async def setup_hook(self):
-        self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
-        self.server_tracker = PublicServerTracker(self.http_session)
+        self.http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=12)
+        )
+
+        self.server_tracker = PublicServerTracker(
+            self.http_session
+        )
+
         self.store.expire()
-        for session in self.store.all():
-            if not session['locked']:
-                for copy in self.store.copies(session['id']):
-                    self.add_view(SessionView(self, session), message_id=int(copy['message_id']))
-        # Repaint saved cards using the latest layout after a code deployment.
-        # Message edits carry no @everyone mention, so they do not re-ping.
         self.store.invalidate_copies()
-        await self.tree.sync(guild=discord.Object(id=self.guild_id))
+
+        await self.tree.sync(
+            guild=discord.Object(id=self.guild_id)
+        )
+
         self.maintenance.start()
 
     async def on_ready(self):
-        LOG.info('Logged in as %s. /hop and /advanced hop are registered.', self.user)
+        LOG.info("Logged in as %s", self.user)
 
     async def private_error(self, interaction, text):
         if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True, allowed_mentions=NO_MENTIONS)
+            await interaction.followup.send(
+                text,
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS
+            )
         else:
-            await interaction.response.send_message(text, ephemeral=True, allowed_mentions=NO_MENTIONS)
+            await interaction.response.send_message(
+                text,
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS
+            )
 
-    async def authorize_attendance(self, sid, user_id):
-        session = self.store.get(sid)
-        self.store.authorize(session, user_id)
-        guild = self.get_guild(int(session['guild_id']))
-        if guild is None:
-            raise SessionError('The invitation server is unavailable.')
-        member = guild.get_member(user_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(user_id)
-            except discord.NotFound as exc:
-                raise SessionError('You must still be a member of the invitation server.') from exc
+    def active_session(self):
+        self.store.expire()
+
+        sessions = [
+            session
+            for session in self.store.all()
+            if not session["locked"]
+            and session["recipients"] is None
+            and session["guild_id"] == str(self.guild_id)
+            and self.store.copies(session["id"])
+        ]
+
+        if not sessions:
+            return None
+
+        return max(
+            sessions,
+            key=lambda session: session["created_at"]
+        )
+
+    def is_playing(self, member, session):
         if member.bot:
-            raise SessionError('Bot accounts cannot join an attendance list.')
-        return session
+            return False
+
+        game_key = session["game"]
+        game_name = session["game_name"].casefold()
+        target = instance_target(session.get("join_url"))
+
+        for activity in member.activities:
+
+            if activity.type != discord.ActivityType.playing:
+                continue
+
+            name = str(
+                getattr(activity, "name", "") or ""
+            ).casefold()
+
+            details = str(
+                getattr(activity, "details", "") or ""
+            ).casefold()
+
+            state = str(
+                getattr(activity, "state", "") or ""
+            ).casefold()
+
+            activity_text = " ".join(
+                [name, details, state]
+            )
+
+            if game_key == "bf":
+                if "scuffed become fumo" in activity_text:
+                    continue
+
+            if not re.search(
+                rf"(?<!\w){re.escape(game_name)}(?!\w)",
+                activity_text
+            ):
+                continue
+
+            for attribute in (
+                "url",
+                "details_url",
+                "state_url"
+            ):
+                url = getattr(activity, attribute, None)
+
+                if not url:
+                    continue
+
+                reported = instance_target(url)
+
+                if target and reported and target != reported:
+                    break
+
+            else:
+                return True
+
+        return False
+
+    def detect_players(self, session):
+        guild = self.get_guild(
+            int(session["guild_id"])
+        )
+
+        if guild is None or guild.unavailable:
+            return None
+
+        recipients = session["recipients"]
+
+        return {
+            str(member.id): member.display_name
+            for member in guild.members
+            if self.is_playing(member, session)
+            and (
+                recipients is None
+                or str(member.id) in recipients
+            )
+        }
+
+    def update_players(self, session):
+        detected = self.detect_players(session)
+
+        if detected is None:
+            return self.store.get(session["id"])
+
+        return self.store.set_detected(
+            session["id"],
+            detected
+        )
+
+    async def manage_players(
+        self,
+        interaction,
+        members,
+        added
+    ):
+        try:
+            if interaction.guild_id != self.guild_id:
+                raise SessionError(
+                    "Use this command in the configured server."
+                )
+
+            session = self.active_session()
+
+            if session is None:
+                raise SessionError(
+                    "No active hop. Use /hop first."
+                )
+
+            is_host = (
+                str(interaction.user.id) == session["host_id"]
+            )
+
+            is_admin = (
+                interaction.user.guild_permissions.administrator
+            )
+
+            if not is_host and not is_admin:
+                raise SessionError(
+                    "Only the hop host or an administrator "
+                    "can manage players."
+                )
+
+            names = {
+                str(member.id): member.display_name
+                for member in members
+                if member is not None and not member.bot
+            }
+
+            if not names:
+                raise SessionError("Select at least one player.")
+
+            self.store.set_overrides(
+                session["id"],
+                names,
+                added
+            )
+
+            action = "Added" if added else "Removed"
+
+            await interaction.response.send_message(
+                f"{action}: "
+                + ", ".join(
+                    safe_name(name)
+                    for name in names.values()
+                ),
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS
+            )
+
+            await self.refresh(session["id"])
+
+        except SessionError as exc:
+            await self.private_error(
+                interaction,
+                str(exc)
+            )
 
     async def target_channel(self, interaction):
-        channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
-        if not isinstance(channel, discord.TextChannel) or channel.guild.id != self.guild_id:
-            raise SessionError('HOP_CHANNEL_ID must be a text channel in the configured Discord server.')
-        me = channel.guild.me
-        permissions = channel.permissions_for(me)
-        needed = ('view_channel', 'send_messages', 'embed_links', 'attach_files', 'read_message_history', 'mention_everyone')
-        missing = [name for name in needed if not getattr(permissions, name)]
+        channel = (
+            self.get_channel(self.channel_id)
+            or await self.fetch_channel(self.channel_id)
+        )
+
+        if (
+            not isinstance(channel, discord.TextChannel)
+            or channel.guild.id != self.guild_id
+        ):
+            raise SessionError(
+                "The configured hop channel is invalid."
+            )
+
+        permissions = channel.permissions_for(
+            channel.guild.me
+        )
+
+        needed = (
+            "view_channel",
+            "send_messages",
+            "embed_links",
+            "attach_files",
+            "read_message_history",
+            "mention_everyone"
+        )
+
+        missing = [
+            name for name in needed
+            if not getattr(permissions, name)
+        ]
+
         if missing:
-            raise SessionError('The bot needs these channel permissions: ' + ', '.join(missing))
-        caller = channel.permissions_for(interaction.user)
+            raise SessionError(
+                "Missing permissions: "
+                + ", ".join(missing)
+            )
+
         return channel
 
-    async def create_hop(self, interaction, game_key, private_text):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        cooldown_key = None
+    async def create_hop(
+        self,
+        interaction,
+        game_key,
+        private_text
+    ):
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True
+        )
+
         session = None
+        cooldown_key = None
         delivered = 0
+
         try:
-            if interaction.guild_id != self.guild_id or not isinstance(interaction.user, discord.Member):
-                raise SessionError('Run this command in the configured Discord server.')
+            if (
+                interaction.guild_id != self.guild_id
+                or not isinstance(
+                    interaction.user,
+                    discord.Member
+                )
+            ):
+                raise SessionError(
+                    "Use this command in the configured server."
+                )
+
             is_private = private_text is not None
+
             if is_private:
                 guild = interaction.guild
+
                 if not guild.chunked:
                     await guild.chunk(cache=True)
-                recipients = resolve_recipients(private_text, guild.members, self.config['aliases'],
-                                                 interaction.user, self.config['max_private_recipients'])
-                cooldown_key = f'private:{self.guild_id}:{interaction.user.id}'
-                cooldown_seconds = self.config['private_cooldown_seconds']
+
+                recipients = resolve_recipients(
+                    private_text,
+                    guild.members,
+                    self.config["aliases"],
+                    interaction.user,
+                    self.config["max_private_recipients"]
+                )
+
+                key = (
+                    f"private:{self.guild_id}:"
+                    f"{interaction.user.id}"
+                )
+
+                cooldown = self.config[
+                    "private_cooldown_seconds"
+                ]
+
                 channel = None
+
             else:
                 recipients = None
-                channel = await self.target_channel(interaction)
-                cooldown_key = f'public:{self.guild_id}'
-                cooldown_seconds = self.config['public_cooldown_seconds']
-            # Reserve before any network await to prevent simultaneous commands bypassing cooldown.
-            key = cooldown_key
-            cooldown_key = None
-            self.store.reserve_cooldown(key, cooldown_seconds)
+
+                channel = await self.target_channel(
+                    interaction
+                )
+
+                key = f"public:{self.guild_id}"
+
+                cooldown = self.config[
+                    "public_cooldown_seconds"
+                ]
+
+            self.store.reserve_cooldown(key, cooldown)
             cooldown_key = key
-            game = self.config['games'][game_key]
+
+            game = self.config["games"][game_key]
+
             try:
-                url, note = await resolve_server(game, self.http_session)
+                url, note = await resolve_server(
+                    game,
+                    self.http_session
+                )
+
             except ServerUnavailable as exc:
-                url, note = None, 'Roblox server lookup unavailable: ' + str(exc)
+                url = None
+                note = str(exc)
+
             session = self.store.create(
-                self.guild_id, game_key, game['name'], interaction.user.id, interaction.user.display_name,
-                [str(member.id) for member in recipients] if is_private else None, url, note,
+                self.guild_id,
+                game_key,
+                game["name"],
+                interaction.user.id,
+                interaction.user.display_name,
+                [
+                    str(member.id)
+                    for member in recipients
+                ] if is_private else None,
+                url,
+                note
             )
+
+            session = self.update_players(session)
+
             await self.update_population(session)
-            session = self.store.get(session['id'])
-            failed = []
+
+            session = self.store.get(session["id"])
+
             if is_private:
-                # Sequential delivery makes each receipt durable before attempting the next DM.
+                failed = []
+
                 for member in recipients:
                     try:
-                        message = await member.send(view=SessionView(self, session), allowed_mentions=NO_MENTIONS)
+                        message = await member.send(
+                            view=SessionView(self, session),
+                            allowed_mentions=NO_MENTIONS
+                        )
+
                         delivered += 1
-                        self.store.add_copy(session['id'], message.channel.id, message.id, session['revision'])
+
+                        self.store.add_copy(
+                            session["id"],
+                            message.channel.id,
+                            message.id,
+                            session["revision"]
+                        )
+
                     except discord.HTTPException:
-                        failed.append(safe_name(member.display_name))
-                result = f'Private invitation delivered to {delivered} of {len(recipients)} people, including you.'
+                        failed.append(
+                            safe_name(member.display_name)
+                        )
+
+                result = (
+                    f"Private invitation delivered to "
+                    f"{delivered} of {len(recipients)} people."
+                )
+
                 if failed:
-                    result += '\nCould not DM: ' + ', '.join(failed) + '. They may have DMs disabled.'
+                    result += (
+                        "\nCould not DM: "
+                        + ", ".join(failed)
+                    )
+
             else:
                 message = await channel.send(
                     view=SessionView(self, session),
-                    allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False, replied_user=False),
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=True,
+                        users=False,
+                        roles=False,
+                        replied_user=False
+                    )
                 )
+
                 delivered += 1
-                self.store.add_copy(session['id'], message.channel.id, message.id, session['revision'])
-                result = f'Invitation posted in {channel.mention}: {message.jump_url}'
-            if not url:
-                result += '\n' + note
+
+                self.store.add_copy(
+                    session["id"],
+                    message.channel.id,
+                    message.id,
+                    session["revision"]
+                )
+
+                for previous in self.store.all():
+                    if (
+                        previous["id"] != session["id"]
+                        and previous["recipients"] is None
+                        and previous["guild_id"] == str(
+                            self.guild_id
+                        )
+                        and not previous["locked"]
+                        and previous["created_at"]
+                        <= session["created_at"]
+                    ):
+                        self.store.finish(previous["id"])
+
+                result = "Invitation posted."
+
             if not delivered:
-                self.store.delete(session['id'])
+                self.store.delete(session["id"])
                 self.store.release_cooldown(cooldown_key)
+
             if delivered and not is_private:
                 await interaction.delete_original_response()
+
             else:
                 await interaction.edit_original_response(
                     content=result,
                     allowed_mentions=NO_MENTIONS
                 )
-            # Someone could have responded while the remaining DMs were being delivered.
+
             if delivered:
-                await self.refresh(session['id'])
+                await self.refresh(session["id"])
+
         except (SessionError, discord.HTTPException) as exc:
             if delivered == 0:
                 if session:
-                    self.store.delete(session['id'])
+                    self.store.delete(session["id"])
+
                 if cooldown_key:
                     self.store.release_cooldown(cooldown_key)
-            text = str(exc) if isinstance(exc, SessionError) else 'Discord could not deliver the invitation. Check the channel permissions.'
-            await interaction.edit_original_response(content=text, allowed_mentions=NO_MENTIONS)
+
+            await interaction.edit_original_response(
+                content=str(exc),
+                allowed_mentions=NO_MENTIONS
+            )
 
     async def refresh(self, sid):
         async with self.refresh_lock:
             session = self.store.get(sid)
+
             for copy in self.store.copies(sid):
-                if copy['revision'] >= session['revision']:
+                if copy["revision"] >= session["revision"]:
                     continue
+
                 try:
-                    channel = self.get_channel(int(copy['channel_id'])) or await self.fetch_channel(int(copy['channel_id']))
-                    message = channel.get_partial_message(int(copy['message_id']))
-                    # Clear legacy content/embeds when an older invitation is upgraded to V2.
-                    await message.edit(content=None, embeds=[], attachments=[],
-                                       view=SessionView(self, session), allowed_mentions=NO_MENTIONS)
-                    self.store.mark_copy(copy['message_id'], session['revision'])
+                    channel = (
+                        self.get_channel(
+                            int(copy["channel_id"])
+                        )
+                        or await self.fetch_channel(
+                            int(copy["channel_id"])
+                        )
+                    )
+
+                    message = channel.get_partial_message(
+                        int(copy["message_id"])
+                    )
+
+                    await message.edit(
+                        content=None,
+                        embeds=[],
+                        attachments=[],
+                        view=SessionView(self, session),
+                        allowed_mentions=NO_MENTIONS
+                    )
+
+                    self.store.mark_copy(
+                        copy["message_id"],
+                        session["revision"]
+                    )
+
                 except discord.NotFound:
-                    self.store.remove_copy(copy['message_id'])
+                    self.store.remove_copy(
+                        copy["message_id"]
+                    )
+
                 except discord.HTTPException as exc:
-                    # Keep the old revision; maintenance will retry after a temporary failure.
-                    LOG.warning('Card update deferred (%s).', type(exc).__name__)
+                    LOG.warning(
+                        "Card update deferred: %s",
+                        exc
+                    )
 
     async def update_population(self, session):
         if self.server_tracker is None:
             return
+
         try:
-            population = await self.server_tracker.population(session['join_url'])
+            population = await self.server_tracker.population(
+                session["join_url"]
+            )
+
         except ServerUnavailable:
-            # Do not present stale or guessed data as a live player count.
-            population = {'status': 'unavailable', 'players': None, 'capacity': None}
-        self.store.set_population(session['id'], population)
+            population = {
+                "status": "unavailable",
+                "players": None,
+                "capacity": None
+            }
+
+        self.store.set_population(
+            session["id"],
+            population
+        )
 
     @tasks.loop(seconds=5)
     async def maintenance(self):
         try:
             self.store.expire()
-            if time.monotonic() - self.last_population_check >= 30:
-                for session in self.store.all():
-                    if self.store.copies(session['id']):
-                        await self.update_population(session)
-                self.last_population_check = time.monotonic()
+
             for session in self.store.all():
-                if any(c['revision'] < session['revision'] for c in self.store.copies(session['id'])):
-                    await self.refresh(session['id'])
-        except Exception as exc:
-            LOG.error('Maintenance failed (%s); retrying next cycle.', type(exc).__name__)
+                if (
+                    not session["locked"]
+                    and self.store.copies(session["id"])
+                ):
+                    self.update_players(session)
+
+            if (
+                time.monotonic()
+                - self.last_population_check >= 30
+            ):
+                for session in self.store.all():
+                    if (
+                        not session["locked"]
+                        and self.store.copies(session["id"])
+                    ):
+                        await self.update_population(session)
+
+                self.last_population_check = time.monotonic()
+
+            for session in self.store.all():
+                if any(
+                    copy["revision"] < session["revision"]
+                    for copy in self.store.copies(session["id"])
+                ):
+                    await self.refresh(session["id"])
+
+        except Exception:
+            LOG.exception("Maintenance failed.")
 
     @maintenance.before_loop
     async def before_maintenance(self):
@@ -251,30 +705,59 @@ class HopBot(discord.Client):
 
     async def close(self):
         self.maintenance.cancel()
+
         if self.http_session:
             await self.http_session.close()
+
         await super().close()
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s %(levelname)s "
+            "%(name)s: %(message)s"
+        )
+    )
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--check', action='store_true', help='Validate local config without connecting to Discord.')
+
+    parser.add_argument(
+        "--check",
+        action="store_true"
+    )
+
     args = parser.parse_args()
     config = load_config()
+
     if args.check:
-        print('Configuration is valid. Games: ' + ', '.join(config['games']))
-        print('No Discord connection or messages were made.')
+        print("Configuration is valid.")
         return
+
     token, guild_id, channel_id = credentials()
-    directory = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
-    store = Store(directory / 'attendance.sqlite3')
-    bot = HopBot(config, guild_id, channel_id, store)
+
+    directory = Path(
+        os.getenv("DATA_DIR", str(ROOT / "data"))
+    )
+
+    store = Store(
+        directory / "attendance.sqlite3"
+    )
+
+    bot = HopBot(
+        config,
+        guild_id,
+        channel_id,
+        store
+    )
+
     try:
         bot.run(token, log_handler=None)
+
     finally:
         store.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
